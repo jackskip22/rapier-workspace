@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: MIT
+import {fault} from './fault.mjs';
+import {SIGNATURE, FTYP, BRAND, CODESTREAM, PARTIAL, LEVEL, BROB, RECONSTRUCTION, fileHeader, boxHeader, boxWords, boxCursor, nextBox, endBoxes as containerEnd} from './container.mjs';
+import {journaling, journalTool, sliceBytes} from './step-journal.mjs';
+import {readFrames, frameStarts} from './framing.mjs';
+import {prepareColorEncoding} from './color-info.mjs';
+import {prepareICC} from './icc-write.mjs';
+
+const INDEX = 0x6a786c69, GAIN = 0x6a68676d, U63 = 9223372036854775807n;
+const invalid = message => fault('JXL_INPUT', message);
+const fourcc = value => String.fromCharCode(value >>> 24, value >>> 16 & 255, value >>> 8 & 255, value & 255);
+
+function record(value, name) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid(name + ' is an object.');
+}
+function uint(value, maximum, name, minimum = 0) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) throw invalid(name + ' is an integer from ' + minimum + ' to ' + maximum + '.');
+  return value;
+}
+function limit(options) { record(options, 'Container options'); return uint(options.maxBytes ?? Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER, 'maxBytes', 1); }
+function boxLimit(options) { return uint(options.maxBoxes ?? 65536, Number.MAX_SAFE_INTEGER, 'maxBoxes', 1); }
+function bounded(length, maximum) {
+  if (!Number.isSafeInteger(length) || length > maximum) throw fault('JXL_SIZE', 'The JPEG XL container exceeds maxBytes.');
+  return length;
+}
+function byteArray(value, name) { if (!(value instanceof Uint8Array)) throw invalid(name + ' is a Uint8Array.'); return value; }
+function joinBytes(parts, maximum) {
+  const length = parts.reduce((sum, part) => bounded(sum + part.length, maximum), 0), result = new Uint8Array(length);
+  let cursor = 0;
+  for (const part of parts) { result.set(part, cursor); cursor += part.length; }
+  return result;
+}
+function typeCode(name) {
+  if (typeof name !== 'string' || name.length !== 4 || Array.from(name).some(c => c.charCodeAt(0) > 255))
+    throw invalid('boxType is exactly four byte-valued characters.');
+  let value = 0; for (const c of name) value = value * 256 + c.charCodeAt(0); return value;
+}
+
+export function containerBoxHeader(boxType, bodyByteLength, {extended = false} = {}) {
+  if (typeof extended !== 'boolean') throw invalid('extended is a boolean.');
+  return boxHeader(typeCode(boxType), bodyByteLength, extended);
+}
+
+function containerStart(bytes, maximum) {
+  byteArray(bytes, 'JPEG XL input'); bounded(bytes.length, maximum);
+  const prefix = bytes.subarray(0, Math.min(bytes.length, SIGNATURE.length));
+  if (prefix[0] === 255 && prefix[1] === 10) return {raw: true};
+  if (!SIGNATURE.every((byte, i) => prefix[i] === byte)) throw invalid('Invalid JPEG XL signature.');
+  return {...boxCursor(), full: null};
+}
+function containerNext(bytes, maxBoxes, state, words, span, byIndex) {
+  const row = nextBox(bytes, maxBoxes, state, words);
+  if (!row) return null;
+  const {entry: box, sequence, last, unbounded} = row, {at, body, end, type} = box;
+  const data = span(body, end), headerLength = body - at, entry = {...box, data, headerLength, unbounded};
+  let fragment;
+  if (type === CODESTREAM) state.full = data;
+  else if (type === PARTIAL) {
+    fragment = {sequence, last, byteOffset: body + 4, byteLength: end - body - 4, headerLength};
+    byIndex.set(sequence, span(body + 4, end));
+  }
+  return {entry, fragment};
+}
+function containerSignature(codestream) {
+  const signature = codestream.subarray(0, 2);
+  if (signature[0] !== 255 || signature[1] !== 10) throw invalid('Invalid logical JPEG XL codestream signature.');
+}
+const rawContainer = bytes => ({codestream: bytes, level: 5, minorVersion: 0, entries: [], fragments: []});
+function scanContainer(bytes, maximum, maxBoxes = Number.MAX_SAFE_INTEGER) {
+  const state = containerStart(bytes, maximum);
+  if (state.raw) return rawContainer(bytes);
+  const words = boxWords(bytes), entries = [], fragments = [], byIndex = new Map();
+  const span = (from, to) => sliceBytes(bytes, from, to);
+  while (state.at < bytes.length) {
+    const row = containerNext(bytes, maxBoxes, state, words, span, byIndex);
+    if (row) { entries.push(row.entry); if (row.fragment) fragments.push(row.fragment); }
+  }
+  containerEnd(state);
+  let codestream = state.full;
+  if (!codestream) {
+    const parts = [];
+    for (let i = 0; i < fragments.length; i++) { if (!byIndex.has(i)) throw invalid('Missing JPEG XL codestream fragment.'); parts.push(byIndex.get(i)); }
+    codestream = joinBytes(parts, maximum);
+  }
+  containerSignature(codestream);
+  return {codestream, level: state.level, minorVersion: state.minorVersion, entries, fragments};
+}
+
+export function inspectContainer(bytes, options = {}) {
+  const source = scanContainer(bytes, limit(options), boxLimit(options));
+  return {codestream: source.codestream.slice(), level: source.level, minorVersion: source.minorVersion,
+    fragments: source.fragments.map(row => ({...row})),
+    auxiliary: source.entries.filter(row => ![FTYP, LEVEL, CODESTREAM, PARTIAL].includes(row.type)).map(row =>
+      ({boxType: fourcc(row.type), data: row.data.slice(), extended: row.headerLength === 16}))};
+}
+
+export function readContainer(bytes, options = {}) {
+  const maximum = limit(options), maxBoxes = boxLimit(options);
+  const source = scanContainer(bytes, maximum, maxBoxes);
+  return {codestream: source.codestream, level: source.level, minorVersion: source.minorVersion,
+    auxiliary: source.entries.filter(row => ![FTYP, LEVEL, CODESTREAM, PARTIAL].includes(row.type)).map(row =>
+      ({boxType: fourcc(row.type), data: row.data, extended: row.headerLength === 16}))};
+}
+
+export function* readContainerSteps(bytes, options = {}) {
+  if (!journaling()) return readContainer(bytes, options);
+  return yield* journalTool('containerRead')(bytes, options, {limit, boxLimit, containerStart, containerNext, containerEnd,
+    containerSignature, boxWords, fourcc, invalid, ignored: [FTYP, LEVEL, CODESTREAM, PARTIAL]});
+}
+
+function validateOrder(order, chunks, stream, options) {
+  const METADATA_ONLY = typeof __RAPIER_JXL_METADATA__ !== 'undefined' && __RAPIER_JXL_METADATA__ === true;
+  if (!Array.isArray(order) || order.length !== chunks.length) throw invalid('fragmentOrder lists each fragment exactly once.');
+  if (options.allowBufferedFrameEnds !== undefined && typeof options.allowBufferedFrameEnds !== 'boolean') throw invalid('allowBufferedFrameEnds is a boolean.');
+  const positions = new Int32Array(chunks.length); positions.fill(-1);
+  for (let i = 0; i < order.length; i++) {
+    const value = uint(order[i], chunks.length - 1, 'fragmentOrder entry');
+    if (positions[value] !== -1) throw invalid('fragmentOrder contains a repeated fragment.');
+    positions[value] = i;
+  }
+  if (positions.every((value, i) => value === i)) return false;
+  let starts = options.frameStarts;
+  if (starts === undefined) {
+    starts = METADATA_ONLY ? frameStarts(stream, options.iccBitLength) : (framed => [...(framed.preview ? [framed.preview.start] : []), ...framed.frames.map(frame => frame.start)])(readFrames(stream, {iccBits: options.iccBitLength}));
+  }
+  if (!Array.isArray(starts) || !starts.length) throw invalid('frameStarts declares every frame header byte offset.');
+  let previous = -1, chunk = 0;
+  const barriers = new Set([0]), endings = new Set();
+  for (const start of starts) {
+    uint(start, stream.length - 1, 'frameStarts entry', 2);
+    if (start <= previous) throw invalid('frameStarts is strictly increasing.'); previous = start;
+    while (chunk + 1 < chunks.length && chunks[chunk + 1].start <= start) chunk++;
+    barriers.add(chunk);
+    if (chunk) endings.add(chunk - 1);
+  }
+  const beforeMax = new Int32Array(chunks.length), afterMin = new Int32Array(chunks.length);
+  let highest = -1, lowest = chunks.length;
+  for (let i = 0; i < chunks.length; i++) { beforeMax[i] = highest; highest = Math.max(highest, positions[i]); }
+  for (let i = chunks.length - 1; i >= 0; i--) { afterMin[i] = lowest; lowest = Math.min(lowest, positions[i]); }
+  for (const boundary of barriers) if (beforeMax[boundary] >= positions[boundary] || afterMin[boundary] <= positions[boundary])
+    throw invalid('Frame-start fragments must stay in order.');
+  if (!options.allowBufferedFrameEnds) for (const boundary of endings) if (beforeMax[boundary] >= positions[boundary] || afterMin[boundary] <= positions[boundary])
+    throw invalid('Keep each frame start\'s preceding fragment in order, or set allowBufferedFrameEnds.');
+  return true;
+}
+
+export function reframeContainer(bytes, options = {}) {
+  const maximum = limit(options), source = scanContainer(bytes, maximum, boxLimit(options)), stream = source.codestream;
+  const extended = options.extended ?? false;
+  if (typeof extended !== 'boolean') throw invalid('extended is a boolean.');
+  const level = options.level ?? source.level;
+  if (level !== 5 && level !== 10 || source.level === 10 && level !== 10) throw invalid('Level is 5 or 10, and a level 10 file stays 10.');
+  const fragmenting = options.chunkSize !== undefined || options.fragmentOrder !== undefined;
+  const chunkSize = fragmenting
+    ? uint(options.chunkSize === undefined ? Math.max(stream.length, 1) : options.chunkSize, 0x7fffffff, 'chunkSize', 1)
+    : Math.max(stream.length, 1);
+  const fragmentCount = stream.length === 0 ? 0 : Math.ceil(stream.length / chunkSize);
+  if (fragmenting && fragmentCount > 0x80000000) throw fault('JXL_SIZE', 'A JPEG XL stream has at most 2147483648 fragments.');
+  const headerLen = extended ? 16 : 8;
+  const ftyp = source.entries.length ? source.entries[0].data.slice() : new Uint8Array([106,120,108,32,0,0,0,0,106,120,108,32]);
+  const wantLevel = level === 10 || source.entries.some(row => row.type === LEVEL);
+  const auxiliary = source.entries.filter(row => ![FTYP, LEVEL, CODESTREAM, PARTIAL].includes(row.type));
+  const authoredBoxes = 1 + Number(wantLevel) + auxiliary.length + (fragmenting ? fragmentCount : 1);
+  let total = SIGNATURE.length + headerLen + ftyp.length;
+  if (wantLevel) total = bounded(total + headerLen + 1, maximum);
+  for (const row of auxiliary) if (row.type !== INDEX) total = bounded(total + headerLen + row.data.length, maximum);
+  if (!fragmenting) total = bounded(total + headerLen + stream.length, maximum);
+  else total = bounded(total + fragmentCount * (headerLen + 4) + stream.length, maximum);
+  for (const row of auxiliary) if (row.type === INDEX) total = bounded(total + headerLen + row.data.length, maximum);
+  if (authoredBoxes > boxLimit(options)) throw invalid('JPEG XL box count exceeds the limit.');
+
+  let outOfOrder = false, order = null;
+  if (fragmenting && options.fragmentOrder !== undefined) {
+    const chunks = {length: fragmentCount};
+    for (let i = 0; i < fragmentCount; i++) chunks[i] = {start: i * chunkSize};
+    order = options.fragmentOrder;
+    outOfOrder = validateOrder(order, chunks, stream, options);
+  }
+  const minorVersion = options.minorVersion ?? (outOfOrder ? 1 : 0);
+  if (minorVersion !== 0 && minorVersion !== 1 || outOfOrder && minorVersion !== 1) throw invalid('Out-of-order fragments require minorVersion 1.');
+  new DataView(ftyp.buffer, ftyp.byteOffset, ftyp.byteLength).setUint32(4, minorVersion);
+
+  const out = new Uint8Array(total);
+  let at = 0;
+  const put = part => { out.set(part, at); at += part.length; };
+  put(SIGNATURE); put(boxHeader(FTYP, ftyp.length, extended)); put(ftyp);
+  if (wantLevel) { put(boxHeader(LEVEL, 1, extended)); put(Uint8Array.of(level)); }
+  for (const row of auxiliary) if (row.type !== INDEX) { put(boxHeader(row.type, row.data.length, extended)); put(row.data); }
+  if (!fragmenting) { put(boxHeader(CODESTREAM, stream.length, extended)); put(stream); }
+  else {
+    const writeFragment = index => {
+      const start = index * chunkSize, end = Math.min(stream.length, start + chunkSize), len = end - start;
+      put(boxHeader(PARTIAL, len + 4, extended));
+      const counter = new Uint8Array(4);
+      new DataView(counter.buffer).setUint32(0, index + (index === fragmentCount - 1 ? 0x80000000 : 0));
+      put(counter); out.set(stream.subarray(start, end), at); at += len;
+    };
+    if (order) for (const index of order) writeFragment(index);
+    else for (let index = 0; index < fragmentCount; index++) writeFragment(index);
+  }
+  for (const row of auxiliary) if (row.type === INDEX) { put(boxHeader(row.type, row.data.length, extended)); put(row.data); }
+  return out;
+}
+
+function integer63(value, name, minimum = 0n) {
+  if (typeof value === 'number') { if (!Number.isSafeInteger(value)) throw invalid(name + ' is a safe integer or bigint.'); value = BigInt(value); }
+  if (typeof value !== 'bigint' || value < minimum || value > U63) throw invalid(name + ' is an unsigned 63-bit integer.');
+  return value;
+}
+function putVarint(out, value) { do { const byte = Number(value & 127n); value >>= 7n; out.push(byte + (value ? 128 : 0)); } while (value); }
+function compactInteger(value) { return value <= 9007199254740991n ? Number(value) : value; }
+
+export function frameIndexPayload(index, options = {}) {
+  const maximum = limit(options); record(index, 'Frame index');
+  const numerator = uint(index.tickNumerator, 0xffffffff, 'tickNumerator'), denominator = uint(index.tickDenominator, 0xffffffff, 'tickDenominator', 1);
+  if (!Array.isArray(index.frames) || !index.frames.length) throw invalid('A frame index includes the first displayed keyframe.');
+  bounded(index.frames.length * 3 + 9, maximum);
+  const out = []; putVarint(out, BigInt(index.frames.length));
+  const clock = new Uint8Array(8), view = new DataView(clock.buffer); view.setUint32(0, numerator); view.setUint32(4, denominator); out.push(...clock);
+  let previous = 0n;
+  for (let i = 0; i < index.frames.length; i++) {
+    const frame = index.frames[i]; record(frame, 'Frame index entry');
+    const absolute = integer63(frame.byteOffset, 'byteOffset', 2n);
+    if (i && absolute <= previous) throw invalid('Frame index byte offsets are strictly increasing.');
+    putVarint(out, absolute - previous); putVarint(out, integer63(frame.duration, 'duration'));
+    putVarint(out, integer63(frame.framesToNext, 'framesToNext', 1n)); previous = absolute; bounded(out.length, maximum);
+  }
+  return Uint8Array.from(out);
+}
+
+function parseIndex(data) {
+  let cursor = 0;
+  const take = () => {
+    let value = 0n;
+    for (let shift = 0n; shift < 63n; shift += 7n) {
+      if (cursor >= data.length) throw invalid('Truncated frame index integer.');
+      const byte = data[cursor++]; value |= BigInt(byte & 127) << shift;
+      if (byte < 128) return value;
+    }
+    throw invalid('A frame index integer exceeds 63 bits.');
+  };
+  const amount = take();
+  if (!amount || amount > BigInt(Math.floor((data.length - cursor - 8) / 3))) throw invalid('Invalid frame index entry count.');
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength), tickNumerator = view.getUint32(cursor), tickDenominator = view.getUint32(cursor + 4); cursor += 8;
+  if (!tickDenominator) throw invalid('Frame index tickDenominator must be nonzero.');
+  const frames = []; let absolute = 0n;
+  for (let i = 0; i < Number(amount); i++) {
+    const delta = take(), duration = take(), framesToNext = take(); absolute += delta;
+    if (absolute < 2n || absolute > U63 || i && !delta || !framesToNext) throw invalid('Invalid frame index offset or frame distance.');
+    frames.push({byteOffset: compactInteger(absolute), duration: compactInteger(duration), framesToNext: compactInteger(framesToNext)});
+  }
+  if (cursor !== data.length) throw invalid('Unexpected bytes after the frame index.');
+  return {tickNumerator, tickDenominator, frames};
+}
+
+function admitAttachmentBoxCount(source, type, hasPayload, level, options) {
+  const count = source.entries.length
+    ? source.entries.reduce((n, row) => n + Number(row.decoded !== type &&
+        !(row.type === LEVEL && source.level !== level)), 0)
+      + Number(source.level !== level) + Number(hasPayload)
+    : 2 + Number(level === 10) + Number(hasPayload);
+  if (count > boxLimit(options)) throw invalid('JPEG XL box count exceeds the limit.');
+}
+
+function attached(bytes, type, payload, options) {
+  const maximum = limit(options), source = scanContainer(bytes, maximum, boxLimit(options)), extended = options.extended ?? false;
+  if (typeof extended !== 'boolean') throw invalid('extended is a boolean.');
+  const level = options.level ?? source.level;
+  if (level !== 5 && level !== 10 || source.level === 10 && level !== 10) throw invalid('Level is 5 or 10, and a level 10 file stays 10.');
+  const parts = [];
+  if (!source.entries.length) parts.push(fileHeader(level), boxHeader(CODESTREAM, bytes.length), bytes);
+  else {
+    parts.push(SIGNATURE);
+    for (const row of source.entries) if (row.decoded !== type) {
+      if (row.type === LEVEL && source.level !== level) continue;
+      if (row.unbounded) parts.push(boxHeader(row.type, row.data.length, row.headerLength === 16), row.data);
+      else parts.push(bytes.subarray(row.at, row.end));
+      if (row.type === FTYP && source.level !== level) parts.push(boxHeader(LEVEL, 1), Uint8Array.of(level));
+    }
+  }
+  if (payload !== null) parts.push(boxHeader(type, payload.length, extended), payload);
+  return joinBytes(parts, maximum);
+}
+
+export function withFrameIndex(bytes, index, options = {}) {
+  const maximum = limit(options), source = scanContainer(bytes, maximum, boxLimit(options));
+  admitAttachmentBoxCount(source, INDEX, index !== null, options.level ?? source.level, options);
+  const payload = index === null ? null : frameIndexPayload(index, options);
+  if (index !== null) for (const frame of index.frames) if (integer63(frame.byteOffset, 'byteOffset') >= BigInt(source.codestream.length))
+    throw invalid('A frame index byteOffset is outside the codestream.');
+  return attached(bytes, INDEX, payload, options);
+}
+export function readFrameIndex(bytes, options = {}) {
+  const source = scanContainer(bytes, limit(options), boxLimit(options)), entry = source.entries.find(row => row.type === INDEX);
+  if (!entry) return null;
+  const index = parseIndex(entry.data);
+  for (const frame of index.frames) if (integer63(frame.byteOffset, 'byteOffset') >= BigInt(source.codestream.length))
+    throw invalid('A frame index byteOffset falls outside the logical codestream.');
+  return index;
+}
+
+export function gainMapPayload(bundle, options = {}) {
+  const maximum = limit(options); record(bundle, 'Gain map bundle');
+  if ((bundle.version ?? 0) !== 0) throw invalid('The supported gain-map bundle version is 0.');
+  const metadata = byteArray(bundle.gainMapMetadata, 'gainMapMetadata'); uint(metadata.length, 65535, 'gainMapMetadata byte length');
+  const gain = scanContainer(bundle.gainMap, maximum, boxLimit(options)).codestream; uint(gain.length, 0xffffffff, 'gainMap byte length', 2);
+  if (bundle.alternativeColorEncoding !== undefined && bundle.alternativeColorEncodingBytes !== undefined)
+    throw invalid('Give alternativeColorEncoding or its bytes, not both.');
+  const color = bundle.alternativeColorEncoding !== undefined ? prepareColorEncoding(bundle.alternativeColorEncoding).colorData.finish()
+    : bundle.alternativeColorEncodingBytes === undefined ? new Uint8Array(0) : byteArray(bundle.alternativeColorEncodingBytes, 'alternativeColorEncodingBytes');
+  uint(color.length, 255, 'alternative color encoding byte length');
+  if (bundle.alternativeICC !== undefined && bundle.alternativeICCCompressed !== undefined) throw invalid('Choose original alternativeICC or its compressed bytes.');
+  const icc = bundle.alternativeICC !== undefined ? prepareICC(bundle.alternativeICC, {level: options.level ?? 5, compression: bundle.iccCompression}).iccData.finish()
+    : bundle.alternativeICCCompressed === undefined ? new Uint8Array(0) : byteArray(bundle.alternativeICCCompressed, 'alternativeICCCompressed');
+  uint(icc.length, 0xffffffff, 'alternative ICC compressed byte length');
+  const prefix = new Uint8Array(3), suffix = new Uint8Array(4);
+  new DataView(prefix.buffer).setUint16(1, metadata.length); new DataView(suffix.buffer).setUint32(0, icc.length);
+  return joinBytes([prefix, metadata, Uint8Array.of(color.length), color, suffix, icc, gain], maximum);
+}
+
+export function withGainMap(bytes, bundle, options = {}) {
+  const source = scanContainer(bytes, limit(options), boxLimit(options)), settings = {...options, level: options.level ?? source.level};
+  admitAttachmentBoxCount(source, GAIN, bundle !== null, settings.level, settings);
+  return attached(bytes, GAIN, bundle === null ? null : gainMapPayload(bundle, settings), settings);
+}
+export function readGainMap(bytes, options = {}) {
+  const source = scanContainer(bytes, limit(options), boxLimit(options)), entry = source.entries.find(row => row.decoded === GAIN);
+  if (!entry) return null;
+  if (entry.type === BROB) throw invalid('A Brotli-compressed gain map needs decompression first.');
+  const data = entry.data, view = new DataView(data.buffer, data.byteOffset, data.byteLength); let cursor = 0;
+  const part = size => { if (size > data.length - cursor) throw invalid('Truncated gain map bundle.'); const value = data.slice(cursor, cursor + size); cursor += size; return value; };
+  const version = part(1)[0]; if (version !== 0) throw invalid('Unsupported gain-map bundle version.');
+  part(2); const gainMapMetadata = part(view.getUint16(1)), colorLength = part(1)[0], alternativeColorEncodingBytes = part(colorLength);
+  const iccAt = cursor; part(4); const alternativeICCCompressed = part(view.getUint32(iccAt)), gainMap = part(data.length - cursor);
+  if (gainMap[0] !== 255 || gainMap[1] !== 10) throw invalid('A gain map contains a naked JPEG XL codestream.');
+  return {version, gainMapMetadata, alternativeColorEncodingBytes, alternativeICCCompressed, gainMap};
+}
